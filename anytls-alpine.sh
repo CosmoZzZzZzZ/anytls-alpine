@@ -6,11 +6,11 @@
 #   bash anytls-alpine.sh
 #
 # CLI usage:
-#   bash anytls-alpine.sh install|update|config|status|logs|port|password|uninstall
+#   bash anytls-alpine.sh install|update|config|status|logs|port|password|network|uninstall
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 UPSTREAM_REPO="anytls/anytls-go"
 CONFIG_DIR="/etc/AnyTLS"
 SERVER_BIN="${CONFIG_DIR}/server"
@@ -26,6 +26,8 @@ CLIENT_NAME="AnyTLS-Alpine"
 TEMP_DIR=""
 ANYTLS_PORT=""
 ANYTLS_PASSWORD=""
+ANYTLS_NETWORK_MODE=""
+ANYTLS_LISTEN_HOST=""
 DOWNLOADED_BIN=""
 
 if [[ -t 1 ]]; then
@@ -195,6 +197,32 @@ valid_port() {
   [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
 }
 
+valid_network_mode() {
+  [[ "${1:-}" == "ipv4" || "${1:-}" == "ipv6" ]]
+}
+
+network_mode_label() {
+  case "${1:-}" in
+    ipv6) printf 'IPv6\n' ;;
+    *) printf 'IPv4\n' ;;
+  esac
+}
+
+network_mode_listen_host() {
+  case "${1:-}" in
+    ipv6) printf '[::]\n' ;;
+    *) printf '0.0.0.0\n' ;;
+  esac
+}
+
+detect_legacy_network_mode() {
+  if [[ -r "$OPENRC_SCRIPT" ]] && grep -Fq '[::]:' "$OPENRC_SCRIPT"; then
+    printf 'ipv6\n'
+  else
+    printf 'ipv4\n'
+  fi
+}
+
 port_in_use() {
   local port="$1"
 
@@ -232,9 +260,44 @@ choose_port() {
   done
 }
 
+choose_network_mode() {
+  local current="${1:-}" choice="" current_text=""
+
+  while true; do
+    printf '\n请选择服务监听模式：\n' >&2
+    printf '  1. IPv4（监听 0.0.0.0，客户端使用 IPv4）\n' >&2
+    printf '  2. IPv6（监听 [::]，客户端使用 IPv6）\n' >&2
+
+    if valid_network_mode "$current"; then
+      current_text="$(network_mode_label "$current")"
+      read -r -p "请输入 [1-2]；直接回车保留 ${current_text}：" choice
+      [[ -n "$choice" ]] || {
+        printf '%s\n' "$current"
+        return 0
+      }
+    else
+      read -r -p "请输入 [1-2]：" choice
+    fi
+
+    case "$choice" in
+      1 | ipv4 | IPv4 | IPV4)
+        printf 'ipv4\n'
+        return 0
+        ;;
+      2 | ipv6 | IPv6 | IPV6)
+        printf 'ipv6\n'
+        return 0
+        ;;
+      *) warn "无效选择，请输入 1 或 2。" ;;
+    esac
+  done
+}
+
 load_config() {
   ANYTLS_PORT=""
   ANYTLS_PASSWORD=""
+  ANYTLS_NETWORK_MODE=""
+  ANYTLS_LISTEN_HOST=""
 
   if [[ ! -r "$OPENRC_CONFIG" ]]; then
     return 1
@@ -244,16 +307,25 @@ load_config() {
   # shellcheck disable=SC1090
   source "$OPENRC_CONFIG"
 
+  if ! valid_network_mode "${ANYTLS_NETWORK_MODE:-}"; then
+    ANYTLS_NETWORK_MODE="$(detect_legacy_network_mode)"
+  fi
+  ANYTLS_LISTEN_HOST="$(network_mode_listen_host "$ANYTLS_NETWORK_MODE")"
+
   valid_port "${ANYTLS_PORT:-}" && [[ -n "${ANYTLS_PASSWORD:-}" ]]
 }
 
 write_config() {
-  local port="$1" password="$2" config_tmp metadata_tmp
+  local port="$1" password="$2" network_mode="$3" listen_host config_tmp metadata_tmp
 
-  if ! valid_port "$port" || [[ ! "$password" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+  if ! valid_port "$port" \
+    || [[ ! "$password" =~ ^[A-Za-z0-9._~-]+$ ]] \
+    || ! valid_network_mode "$network_mode"; then
     fail "拒绝写入无效配置。"
     return 1
   fi
+
+  listen_host="$(network_mode_listen_host "$network_mode")"
 
   if ! mkdir -p "$CONFIG_DIR" "$(dirname "$OPENRC_CONFIG")"; then
     fail "无法创建配置目录。"
@@ -265,6 +337,8 @@ write_config() {
   if ! {
     printf 'ANYTLS_PORT="%s"\n' "$port"
     printf 'ANYTLS_PASSWORD="%s"\n' "$password"
+    printf 'ANYTLS_NETWORK_MODE="%s"\n' "$network_mode"
+    printf 'ANYTLS_LISTEN_HOST="%s"\n' "$listen_host"
   } >"$config_tmp"; then
     fail "无法写入 ${OPENRC_CONFIG}。"
     return 1
@@ -276,7 +350,8 @@ write_config() {
   fi
 
   if ! {
-    printf 'listen: "0.0.0.0:%s"\n' "$port"
+    printf 'listen: "%s:%s"\n' "$listen_host" "$port"
+    printf 'network_mode: "%s"\n' "$network_mode"
     printf 'auth:\n'
     printf '  type: password\n'
     printf '  password: "%s"\n' "$password"
@@ -305,7 +380,7 @@ write_openrc_service() {
 name="AnyTLS"
 description="AnyTLS proxy server"
 command="/etc/AnyTLS/server"
-command_args="-l 0.0.0.0:${ANYTLS_PORT} -p ${ANYTLS_PASSWORD}"
+command_args="-l ${ANYTLS_LISTEN_HOST:-0.0.0.0}:${ANYTLS_PORT} -p ${ANYTLS_PASSWORD}"
 
 supervisor=supervise-daemon
 respawn_delay=5
@@ -361,40 +436,52 @@ start_or_restart_service() {
 }
 
 get_public_ip() {
-  local ip=""
+  local network_mode="${1:-ipv4}" ip=""
 
   if command -v curl >/dev/null 2>&1; then
-    ip="$(
-      curl -4fsS --connect-timeout 5 --max-time 10 \
-        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
-        | awk -F= '/^ip=/{print $2; exit}' || true
-    )"
-    [[ -n "$ip" ]] || ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-    [[ -n "$ip" ]] || ip="$(curl -6fsS --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null || true)"
+    if [[ "$network_mode" == "ipv6" ]]; then
+      ip="$(
+        curl -6fsS --connect-timeout 5 --max-time 10 \
+          https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+          | awk -F= '/^ip=/{print $2; exit}' || true
+      )"
+      [[ -n "$ip" ]] || ip="$(curl -6fsS --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null || true)"
+    else
+      ip="$(
+        curl -4fsS --connect-timeout 5 --max-time 10 \
+          https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+          | awk -F= '/^ip=/{print $2; exit}' || true
+      )"
+      [[ -n "$ip" ]] || ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    fi
   fi
 
   printf '%s\n' "$ip"
 }
 
 show_config() {
-  local ip host uri
+  local ip host uri mode_label address_placeholder
 
   if ! is_installed || ! load_config; then
     fail "AnyTLS 尚未安装或配置不完整。"
     return 1
   fi
 
-  ip="$(get_public_ip)"
+  mode_label="$(network_mode_label "$ANYTLS_NETWORK_MODE")"
+  address_placeholder="服务器${mode_label}地址"
+  ip="$(get_public_ip "$ANYTLS_NETWORK_MODE")"
   if [[ -z "$ip" ]]; then
-    ip="服务器IP"
-    warn "无法自动获取公网 IP，请在导入链接中手动替换“服务器IP”。"
+    ip="$address_placeholder"
+    warn "无法自动获取公网 ${mode_label} 地址，请在导入链接中手动替换“${address_placeholder}”。"
   fi
 
   host="$ip"
-  [[ "$ip" == *:* ]] && host="[${ip}]"
+  [[ "$ANYTLS_NETWORK_MODE" == "ipv6" ]] && host="[${ip}]"
   uri="anytls://${ANYTLS_PASSWORD}@${host}:${ANYTLS_PORT}/?insecure=1#${CLIENT_NAME}"
 
   printf '\n========== AnyTLS 客户端配置 ==========\n'
+  printf '网络模式：%s\n' "$mode_label"
+  printf '监听地址：%s:%s\n' "$ANYTLS_LISTEN_HOST" "$ANYTLS_PORT"
   printf '地址：%s\n' "$ip"
   printf '端口：%s\n' "$ANYTLS_PORT"
   printf '密码：%s\n' "$ANYTLS_PASSWORD"
@@ -404,6 +491,9 @@ show_config() {
   printf '========================================\n\n'
   warn "服务使用运行时生成的自签名证书，客户端必须允许不安全/跳过证书验证。"
   warn "请只放行 TCP ${ANYTLS_PORT}；本脚本不会关闭系统防火墙。"
+  if [[ "$ANYTLS_NETWORK_MODE" == "ipv6" ]]; then
+    warn "当前为 IPv6 模式，客户端所在网络也必须能够访问 IPv6。"
+  fi
 }
 
 current_version() {
@@ -429,7 +519,7 @@ restore_file() {
 }
 
 install_anytls() {
-  local arch latest port password answer="" had_install=0
+  local arch latest port password network_mode existing_mode="" answer="" had_install=0
   local backup_bin backup_config backup_metadata backup_service backup_version
 
   ensure_dependencies || return 1
@@ -452,6 +542,7 @@ install_anytls() {
     snapshot_file "$VERSION_FILE" "$backup_version"
 
     load_config || true
+    existing_mode="${ANYTLS_NETWORK_MODE:-$(detect_legacy_network_mode)}"
     read -r -p "检测到已有安装，是否保留当前端口和密码？[Y/n] " answer
     if [[ ! "$answer" =~ ^[Nn]$ ]] && valid_port "${ANYTLS_PORT:-}" && [[ -n "${ANYTLS_PASSWORD:-}" ]]; then
       port="$ANYTLS_PORT"
@@ -460,14 +551,16 @@ install_anytls() {
       port="$(choose_port "${ANYTLS_PORT:-}")" || return 1
       password="$(generate_password)"
     fi
+    network_mode="$(choose_network_mode "$existing_mode")" || return 1
   else
+    network_mode="$(choose_network_mode)" || return 1
     port="$(choose_port)" || return 1
     password="$(generate_password)"
   fi
 
   install_binary_file "$DOWNLOADED_BIN" || return 1
 
-  if ! write_config "$port" "$password" || ! write_openrc_service; then
+  if ! write_config "$port" "$password" "$network_mode" || ! write_openrc_service; then
     fail "写入配置失败。"
     return 1
   fi
@@ -539,7 +632,7 @@ update_anytls() {
 }
 
 change_port() {
-  local old_port old_password new_port
+  local old_port old_password old_network_mode new_port
 
   if ! is_installed || ! load_config; then
     fail "AnyTLS 尚未安装或配置不完整。"
@@ -549,12 +642,13 @@ change_port() {
   ensure_openrc_running || return 1
   old_port="$ANYTLS_PORT"
   old_password="$ANYTLS_PASSWORD"
+  old_network_mode="$ANYTLS_NETWORK_MODE"
   new_port="$(choose_port "$old_port")" || return 1
 
-  write_config "$new_port" "$old_password" || return 1
+  write_config "$new_port" "$old_password" "$old_network_mode" || return 1
   if ! start_or_restart_service || ! service_running; then
     fail "使用新端口启动失败，正在恢复端口 ${old_port}。"
-    write_config "$old_port" "$old_password" || true
+    write_config "$old_port" "$old_password" "$old_network_mode" || true
     rc-service "$OPENRC_SERVICE" restart >/dev/null 2>&1 || true
     return 1
   fi
@@ -564,7 +658,7 @@ change_port() {
 }
 
 change_password() {
-  local old_port old_password new_password
+  local old_port old_password old_network_mode new_password
 
   if ! is_installed || ! load_config; then
     fail "AnyTLS 尚未安装或配置不完整。"
@@ -574,17 +668,57 @@ change_password() {
   ensure_openrc_running || return 1
   old_port="$ANYTLS_PORT"
   old_password="$ANYTLS_PASSWORD"
+  old_network_mode="$ANYTLS_NETWORK_MODE"
   new_password="$(generate_password)"
 
-  write_config "$old_port" "$new_password" || return 1
+  write_config "$old_port" "$new_password" "$old_network_mode" || return 1
   if ! start_or_restart_service || ! service_running; then
     fail "使用新密码启动失败，正在恢复旧密码。"
-    write_config "$old_port" "$old_password" || true
+    write_config "$old_port" "$old_password" "$old_network_mode" || true
     rc-service "$OPENRC_SERVICE" restart >/dev/null 2>&1 || true
     return 1
   fi
 
   ok "密码已随机更新。"
+  show_config
+}
+
+change_network_mode() {
+  local old_port old_password old_network_mode new_network_mode
+
+  if ! is_installed || ! load_config; then
+    fail "AnyTLS 尚未安装或配置不完整。"
+    return 1
+  fi
+
+  ensure_openrc_running || return 1
+  old_port="$ANYTLS_PORT"
+  old_password="$ANYTLS_PASSWORD"
+  old_network_mode="$ANYTLS_NETWORK_MODE"
+  new_network_mode="$(choose_network_mode "$old_network_mode")" || return 1
+
+  if [[ "$new_network_mode" == "$old_network_mode" ]]; then
+    ok "网络模式保持为 $(network_mode_label "$old_network_mode")。"
+    show_config
+    return 0
+  fi
+
+  if ! write_config "$old_port" "$old_password" "$new_network_mode" || ! write_openrc_service; then
+    fail "写入新网络模式失败，正在恢复旧配置。"
+    write_config "$old_port" "$old_password" "$old_network_mode" || true
+    write_openrc_service || true
+    return 1
+  fi
+
+  if ! start_or_restart_service || ! service_running; then
+    fail "使用 $(network_mode_label "$new_network_mode") 启动失败，正在恢复旧模式。"
+    write_config "$old_port" "$old_password" "$old_network_mode" || true
+    write_openrc_service || true
+    rc-service "$OPENRC_SERVICE" restart >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  ok "网络模式已改为 $(network_mode_label "$new_network_mode")。"
   show_config
 }
 
@@ -596,7 +730,10 @@ show_status() {
 
   printf '安装版本：%s\n' "$(current_version)"
   rc-service "$OPENRC_SERVICE" status || true
-  load_config && printf '监听端口：%s/TCP\n' "$ANYTLS_PORT"
+  if load_config; then
+    printf '网络模式：%s\n' "$(network_mode_label "$ANYTLS_NETWORK_MODE")"
+    printf '监听地址：%s:%s/TCP\n' "$ANYTLS_LISTEN_HOST" "$ANYTLS_PORT"
+  fi
 }
 
 show_logs() {
@@ -669,12 +806,13 @@ menu() {
     printf ' 3. 查看客户端配置\n'
     printf ' 4. 更改端口\n'
     printf ' 5. 更改密码\n'
-    printf ' 6. 查看服务状态\n'
-    printf ' 7. 查看日志\n'
-    printf ' 8. 卸载 AnyTLS\n'
+    printf ' 6. 更改 IPv4/IPv6 模式\n'
+    printf ' 7. 查看服务状态\n'
+    printf ' 8. 查看日志\n'
+    printf ' 9. 卸载 AnyTLS\n'
     printf ' 0. 退出\n'
     printf '%s\n' '========================================'
-    read -r -p "请输入数字 [0-8]：" choice || exit 0
+    read -r -p "请输入数字 [0-9]：" choice || exit 0
 
     case "$choice" in
       1) install_anytls; pause_menu ;;
@@ -682,9 +820,10 @@ menu() {
       3) show_config; pause_menu ;;
       4) change_port; pause_menu ;;
       5) change_password; pause_menu ;;
-      6) show_status; pause_menu ;;
-      7) show_logs; pause_menu ;;
-      8) uninstall_anytls; pause_menu ;;
+      6) change_network_mode; pause_menu ;;
+      7) show_status; pause_menu ;;
+      8) show_logs; pause_menu ;;
+      9) uninstall_anytls; pause_menu ;;
       0) exit 0 ;;
       *) warn "无效选项。"; pause_menu ;;
     esac
@@ -702,6 +841,7 @@ usage() {
   bash anytls-alpine.sh logs            查看最近日志
   bash anytls-alpine.sh port            更改端口
   bash anytls-alpine.sh password        更改密码
+  bash anytls-alpine.sh network         更改 IPv4/IPv6 模式
   bash anytls-alpine.sh uninstall       卸载
 USAGE_EOF
 }
@@ -728,6 +868,7 @@ main() {
     logs | log) show_logs ;;
     port) change_port ;;
     password | passwd) change_password ;;
+    network | mode | ip) change_network_mode ;;
     uninstall | remove) uninstall_anytls ;;
     *)
       fail "未知命令：${action}"
